@@ -1,9 +1,13 @@
 """Anomaly detectors. All are trained on normal clips only and return one score per clip
-(higher = more anomalous).
+(higher = more anomalous). They work on any (n_bands, T) feature matrix, so the same models serve sound and vibration.
 
 - "gmm": Gaussian mixture on clip-level log-mel statistics; score = negative log-likelihood
 - "knn": distance to the k-th nearest normal training clip in the same feature space
 - "ae":  DCASE-style dense autoencoder on stacked log-mel frames; score = reconstruction error
+- FusionDetector: one detector per modality (sound, vibration); scores are standardised on normal training
+  clips and averaged (score-level fusion)
+
+After fit(), `train_scores_` holds scores of the normal training clips, used to set the decision threshold.
 """
 from pathlib import Path
 
@@ -41,11 +45,16 @@ class ClipStatsDetector(Detector):
     def fit(self, specs):
         x = self._features(specs)
         self.scaler = StandardScaler().fit(x)
-        self._fit(self.scaler.transform(x))
+        x = self.scaler.transform(x)
+        self._fit(x)
+        self.train_scores_ = self._train_scores(x)
         return self
 
     def score(self, specs):
         return self._score(self.scaler.transform(self._features(specs)))
+
+    def _train_scores(self, x):
+        return self._score(x)
 
 
 class GMMDetector(ClipStatsDetector):
@@ -68,6 +77,11 @@ class KNNDetector(ClipStatsDetector):
 
     def _score(self, x):
         dist, _ = self.nn.kneighbors(x)
+        return dist[:, -1]
+
+    def _train_scores(self, x):
+        # leave-one-out: each training clip's nearest neighbour is itself, so skip it
+        dist, _ = self.nn.kneighbors(x, n_neighbors=self.k + 1)
         return dist[:, -1]
 
 
@@ -150,6 +164,7 @@ class AutoencoderDetector(Detector):
 
         if best_state is not None:
             self.model.load_state_dict(best_state)
+        self.train_scores_ = self.score(specs)
         return self
 
     @torch.no_grad()
@@ -171,12 +186,52 @@ class AutoencoderDetector(Detector):
         self.model.to(device)
 
 
-def build(name: str, cfg: dict) -> Detector:
+class FusionDetector(Detector):
+    """Score-level fusion of per-modality detectors. fit/score take {modality: list of feature matrices}."""
+
+    def __init__(self, detectors: dict[str, Detector], method: str = "mean"):
+        if method not in ("mean", "max"):
+            raise ValueError(f"fusion method must be 'mean' or 'max', got {method!r}")
+        self.detectors, self.method = detectors, method
+
+    def fit(self, feats):
+        self.norm = {}
+        for m, det in self.detectors.items():
+            det.fit(feats[m])
+            s = det.train_scores_
+            self.norm[m] = (float(s.mean()), float(s.std()) + 1e-9)
+        self.train_scores_ = self._combine({m: d.train_scores_ for m, d in self.detectors.items()})
+        return self
+
+    def score(self, feats):
+        return self._combine({m: d.score(feats[m]) for m, d in self.detectors.items()})
+
+    def modality_scores(self, feats) -> dict[str, np.ndarray]:
+        """Standardised score of each modality, to see which sensor drove a decision."""
+        return {m: (d.score(feats[m]) - self.norm[m][0]) / self.norm[m][1] for m, d in self.detectors.items()}
+
+    def _combine(self, scores):
+        z = [(scores[m] - mu) / sd for m, (mu, sd) in self.norm.items()]
+        # mean: both sensors must agree; max: an anomaly seen by either sensor is enough
+        return np.max(z, axis=0) if self.method == "max" else np.mean(z, axis=0)
+
+    def save(self, path):
+        for det in self.detectors.values():
+            if isinstance(det, AutoencoderDetector):
+                det.model.cpu()
+                det.device = "cpu"
+        super().save(path)
+
+
+def build(name: str, cfg: dict, modality: str = "sound") -> Detector:
+    if modality == "fusion":
+        return FusionDetector({m: build(name, cfg, m) for m in ("sound", "vibration")},
+                              method=cfg.get("fusion", {}).get("method", "mean"))
     seed = cfg.get("seed", 0)
     if name == "gmm":
         return GMMDetector(**cfg["gmm"], seed=seed)
     if name == "knn":
         return KNNDetector(**cfg["knn"])
     if name == "ae":
-        return AutoencoderDetector(n_frames=cfg["features"]["n_frames"], **cfg["ae"], seed=seed)
+        return AutoencoderDetector(n_frames=cfg["features"][modality]["n_frames"], **cfg["ae"], seed=seed)
     raise ValueError(f"unknown model {name!r}; choose gmm, knn or ae")

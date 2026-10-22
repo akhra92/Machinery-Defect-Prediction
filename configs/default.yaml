@@ -1,16 +1,19 @@
-# Paths
+# DCASE 2024 Task 2 (sound only). Other configs inherit from this file.
+dataset: dcase2024
 data_root: data/dcase2024_dev      # contains <machine>/train/*.wav and <machine>/test/*.wav
-cache_dir: data/cache              # cached log-mel spectrograms
+cache_dir: data/cache              # cached spectrograms
 output_dir: outputs                # trained models, scores, results
+modality: sound                    # sound | vibration | fusion (fusion = sound + vibration)
 
-# Audio / features (DCASE baseline settings)
+# Features per modality (log-mel spectrograms; DCASE baseline settings for sound)
 features:
-  sample_rate: 16000
-  n_fft: 1024
-  hop_length: 512
-  n_mels: 128
-  power: 2.0
-  n_frames: 5                      # frames stacked into one autoencoder input vector
+  sound:
+    sample_rate: 16000             # signals are resampled to this rate
+    n_fft: 1024
+    hop_length: 512
+    n_mels: 128
+    power: 2.0
+    n_frames: 5                    # frames stacked into one autoencoder input vector
 
 # Autoencoder
 ae:
@@ -22,7 +25,7 @@ ae:
   lr: 0.001
   val_fraction: 0.1
 
-# Clip-level classical models (features = mean + std of log-mel over time)
+# Clip-level classical models (features = mean + std of each band over time)
 gmm:
   n_components: 4
   covariance_type: diag

@@ -1,10 +1,16 @@
-"""Generate a tiny synthetic dataset in DCASE layout to smoke-test the pipeline without downloading.
+"""Generate tiny synthetic datasets to smoke-test the pipeline without downloading anything.
 
-Normal = motor hum (harmonics) + noise. Anomaly = the same plus a bearing-like whine or periodic clicks.
-Target-domain clips run at a different speed (domain shift).
+dcase    - DCASE layout, sound only. Normal = motor hum + noise; anomaly adds a whine or clicks.
+           Target-domain clips run at a different speed (domain shift).
+mafaulda - MaFaulDa layout, 8-column CSV (tachometer, 2 x 3-axis accelerometer, microphone) at 50 kHz.
+           Faults: imbalance (strong 1x rotation), misalignment (strong 2x), bearing outer race
+           (impacts at 3x rotation ringing a 3 kHz resonance). Faults are clearer in vibration than in sound.
 
-    python scripts/make_synthetic.py --out data/synthetic
+    python scripts/make_synthetic.py dcase --out data/synthetic
     python -m msad.run --machine synth --model gmm knn ae --set data_root=data/synthetic ae.epochs=5
+    python scripts/make_synthetic.py mafaulda --out data/synthetic_mafaulda
+    python -m msad.run --config configs/mafaulda.yaml --modality sound vibration fusion --model knn ae \
+        --set data_root=data/synthetic_mafaulda ae.epochs=5
 """
 import argparse
 from pathlib import Path
@@ -12,11 +18,9 @@ from pathlib import Path
 import numpy as np
 import soundfile as sf
 
-SR = 16000
 
-
-def machine_sound(rng, f0, seconds, anomaly):
-    t = np.arange(int(SR * seconds)) / SR
+def machine_sound(rng, f0, seconds, anomaly, sr=16000):
+    t = np.arange(int(sr * seconds)) / sr
     y = sum(np.sin(2 * np.pi * f0 * h * t + rng.uniform(0, 6.3)) / h for h in range(1, 8))
     y = y * (1 + 0.05 * np.sin(2 * np.pi * 3 * t)) + rng.normal(0, 0.3, t.size)
     if anomaly:
@@ -24,20 +28,14 @@ def machine_sound(rng, f0, seconds, anomaly):
             y += 0.25 * np.sin(2 * np.pi * rng.uniform(2500, 4000) * t)
         else:
             clicks = np.zeros_like(t)
-            clicks[:: int(SR / rng.uniform(15, 30))] = 3.0
+            clicks[:: int(sr / rng.uniform(15, 30))] = 3.0
             y += np.convolve(clicks, np.hanning(64), mode="same")
     return (0.1 * y / np.abs(y).max()).astype(np.float32)
 
 
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--out", default="data/synthetic")
-    parser.add_argument("--machine", default="synth")
-    parser.add_argument("--seconds", type=float, default=2.0)
-    args = parser.parse_args()
-
-    rng = np.random.default_rng(0)
-    root = Path(args.out) / args.machine
+def make_dcase(out: Path, machine: str, seconds: float, rng):
+    sr = 16000
+    root = out / machine
     speeds = {"source": 50.0, "target": 60.0}
     plan = [("train", "source", "normal", 90), ("train", "target", "normal", 10)] + [
         ("test", d, lab, 25) for d in speeds for lab in ("normal", "anomaly")
@@ -46,10 +44,59 @@ def main():
         (root / split).mkdir(parents=True, exist_ok=True)
         for i in range(n):
             f0 = speeds[domain] * rng.uniform(0.97, 1.03)
-            y = machine_sound(rng, f0, args.seconds, label == "anomaly")
+            y = machine_sound(rng, f0, seconds, label == "anomaly", sr)
             name = f"section_00_{domain}_{split}_{label}_{i:04d}_speed_{int(speeds[domain])}.wav"
-            sf.write(root / split / name, y, SR)
-    print(f"wrote synthetic dataset to {root}")
+            sf.write(root / split / name, y, sr)
+    print(f"wrote synthetic DCASE-style dataset to {root}")
+
+
+def mafaulda_record(rng, f_rot, seconds, fault, sr=50000):
+    t = np.arange(int(sr * seconds)) / sr
+    tach = 5.0 * (np.sin(2 * np.pi * f_rot * t) > 0.99)
+    one_x, two_x = 1.0, 0.3
+    if fault == "imbalance":
+        one_x *= rng.uniform(2.5, 4.0)
+    if fault == "misalignment":
+        two_x *= rng.uniform(4.0, 6.0)
+    shaft = one_x * np.sin(2 * np.pi * f_rot * t) + two_x * np.sin(4 * np.pi * f_rot * t + 1.0)
+    impacts = np.zeros_like(t)
+    if fault == "outer_race":
+        impacts[:: int(sr / (2.998 * f_rot))] = rng.uniform(4.0, 6.0)
+        ring = np.exp(-np.arange(400) / 60) * np.sin(2 * np.pi * 3000 * np.arange(400) / sr)
+        impacts = np.convolve(impacts, ring, mode="same")
+    accel = [g * shaft + 0.5 * impacts * g + rng.normal(0, 0.2, t.size) for g in (0.6, 1.0, 0.8, 0.5, 0.9, 0.7)]
+    mic = 0.2 * shaft + 0.05 * impacts + machine_sound(rng, f_rot * 4, seconds, False, sr) * 5 + rng.normal(0, 0.3, t.size)
+    return np.stack([tach, *accel, mic], axis=1).astype(np.float32)
+
+
+def make_mafaulda(out: Path, seconds: float, rng):
+    groups = {
+        "normal": ("", 30),
+        "imbalance/10g": ("imbalance", 8),
+        "horizontal-misalignment/1.0mm": ("misalignment", 8),
+        "underhang/outer_race/6g": ("outer_race", 8),
+    }
+    for folder, (fault, n) in groups.items():
+        (out / folder).mkdir(parents=True, exist_ok=True)
+        for f_rot in np.linspace(15, 55, n):
+            data = mafaulda_record(rng, f_rot * rng.uniform(0.99, 1.01), seconds, fault)
+            np.savetxt(out / folder / f"{f_rot:.4f}.csv", data, delimiter=",", fmt="%.5f")
+    print(f"wrote synthetic MaFaulDa-style dataset to {out}")
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("kind", choices=["dcase", "mafaulda"])
+    parser.add_argument("--out", default=None)
+    parser.add_argument("--machine", default="synth", help="dcase only")
+    parser.add_argument("--seconds", type=float, default=2.0)
+    args = parser.parse_args()
+
+    rng = np.random.default_rng(0)
+    if args.kind == "dcase":
+        make_dcase(Path(args.out or "data/synthetic"), args.machine, args.seconds, rng)
+    else:
+        make_mafaulda(Path(args.out or "data/synthetic_mafaulda"), args.seconds, rng)
 
 
 if __name__ == "__main__":

@@ -1,7 +1,8 @@
 """Train an anomaly detector on normal clips and evaluate it on the labelled test set.
 
-    python -m msad.run --machine fan --model ae
+    python -m msad.run --machine fan --model ae                              # DCASE 2024, sound
     python -m msad.run --machine all --model gmm knn ae
+    python -m msad.run --config configs/mafaulda.yaml --modality sound vibration fusion --model knn ae
     python -m msad.run --machine fan --model ae --set ae.epochs=20 data_root=data/other
 """
 import argparse
@@ -13,14 +14,25 @@ from pathlib import Path
 import numpy as np
 import yaml
 
-from .data import list_clips, list_machines
+from .data import MODALITIES, get_dataset
 from .features import FeatureCache
 from .metrics import evaluate
 from .models import build
 
 
-def load_config(path: str, overrides: list[str]) -> dict:
-    cfg = yaml.safe_load(Path(path).read_text())
+def _merge(base: dict, override: dict) -> dict:
+    out = dict(base)
+    for k, v in override.items():
+        out[k] = _merge(out[k], v) if isinstance(v, dict) and isinstance(out.get(k), dict) else v
+    return out
+
+
+def load_config(path: str, overrides: list[str] = ()) -> dict:
+    """Load YAML config; a config may name an `inherit:` file (relative to itself) that it overrides."""
+    path = Path(path)
+    cfg = yaml.safe_load(path.read_text())
+    if "inherit" in cfg:
+        cfg = _merge(load_config(path.parent / cfg.pop("inherit")), cfg)
     for item in overrides:
         key, _, value = item.partition("=")
         node = cfg
@@ -31,34 +43,50 @@ def load_config(path: str, overrides: list[str]) -> dict:
     return cfg
 
 
-def run_one(machine: str, model_name: str, cfg: dict, cache: FeatureCache) -> dict:
-    out_dir = Path(cfg["output_dir"]) / machine / model_name
+def modalities_of(modality: str) -> list[str]:
+    return list(MODALITIES) if modality == "fusion" else [modality]
+
+
+def load_features(dataset, clips, modality: str, cfg: dict, desc: str):
+    """{modality: [feature matrix per clip]} for fusion, otherwise a plain list."""
+    feats = {m: FeatureCache(cfg["cache_dir"], dataset, m, cfg).get_many(clips, desc=f"{desc} {m}")
+             for m in modalities_of(modality)}
+    return feats if modality == "fusion" else feats[modality]
+
+
+def run_one(dataset, machine: str, model_name: str, modality: str, cfg: dict) -> dict:
+    out_dir = Path(cfg["output_dir"]) / machine / modality / model_name
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    train = [c for c in list_clips(cfg["data_root"], machine, "train") if c.label in (0, None)]
-    test = list_clips(cfg["data_root"], machine, "test")
-    train_specs = cache.get_many([c.path for c in train], desc=f"{machine} train features")
-    test_specs = cache.get_many([c.path for c in test], desc=f"{machine} test features")
+    train = [c for c in dataset.clips(machine, "train") if c.label in (0, None)]
+    test = dataset.clips(machine, "test")
+    x_train = load_features(dataset, train, modality, cfg, f"{machine} train")
+    x_test = load_features(dataset, test, modality, cfg, f"{machine} test")
 
     t0 = time.time()
-    model = build(model_name, cfg).fit(train_specs)
+    model = build(model_name, cfg, modality).fit(x_train)
     fit_seconds = time.time() - t0
 
-    threshold = float(np.percentile(model.score(train_specs), cfg["threshold_percentile"]))
-    test_scores = model.score(test_specs)
+    threshold = float(np.percentile(model.train_scores_, cfg["threshold_percentile"]))
+    test_scores = model.score(x_test)
+    per_modality = model.modality_scores(x_test) if modality == "fusion" else {}
 
     model.save(out_dir / "model.joblib")
-    (out_dir / "threshold.json").write_text(json.dumps({"threshold": threshold}))
+    meta = {"threshold": threshold, "modality": modality, "model": model_name, "machine": machine, "config": cfg}
+    (out_dir / "meta.json").write_text(json.dumps(meta, indent=1))
     with open(out_dir / "test_scores.csv", "w", newline="") as f:
         w = csv.writer(f)
-        w.writerow(["file", "domain", "label", "score", "predicted_anomaly"])
-        for c, s in zip(test, test_scores):
-            w.writerow([c.path.name, c.domain, c.label, f"{s:.6f}", int(s > threshold)])
-    if getattr(model, "history", None):
-        (out_dir / "history.json").write_text(json.dumps(model.history, indent=1))
+        w.writerow(["file", "segment", "domain", "fault", "label", "score", "predicted_anomaly",
+                    *[f"z_{m}" for m in per_modality]])
+        for i, (c, s) in enumerate(zip(test, test_scores)):
+            w.writerow([c.path.name, c.segment, c.domain, c.fault, c.label, f"{s:.6f}", int(s > threshold),
+                        *[f"{v[i]:.4f}" for v in per_modality.values()]])
+    histories = {m: d.history for m, d in getattr(model, "detectors", {"": model}).items() if getattr(d, "history", None)}
+    if histories:
+        (out_dir / "history.json").write_text(json.dumps(histories, indent=1))
 
-    result = {"machine": machine, "model": model_name, "n_train": len(train), "n_test": len(test),
-              "fit_seconds": round(fit_seconds, 1)}
+    result = {"dataset": cfg.get("dataset", "dcase2024"), "machine": machine, "modality": modality,
+              "model": model_name, "n_train": len(train), "n_test": len(test), "fit_seconds": round(fit_seconds, 1)}
     if all(c.label is not None for c in test):
         result |= evaluate(test, test_scores, threshold, cfg["max_fpr"])
     (out_dir / "results.json").write_text(json.dumps(result, indent=1))
@@ -67,29 +95,38 @@ def run_one(machine: str, model_name: str, cfg: dict, cache: FeatureCache) -> di
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--machine", nargs="+", required=True, help="machine type(s) or 'all'")
-    parser.add_argument("--model", nargs="+", default=["ae"], choices=["gmm", "knn", "ae"])
     parser.add_argument("--config", default="configs/default.yaml")
+    parser.add_argument("--machine", nargs="+", default=["all"], help="machine type(s) or 'all' (default)")
+    parser.add_argument("--modality", nargs="+", choices=[*MODALITIES, "fusion"],
+                        help="default: the config's `modality`")
+    parser.add_argument("--model", nargs="+", default=["ae"], choices=["gmm", "knn", "ae"])
     parser.add_argument("--set", nargs="*", default=[], metavar="KEY=VALUE", help="override config values")
     args = parser.parse_args()
 
     cfg = load_config(args.config, args.set)
     np.random.seed(cfg["seed"])
-    machines = list_machines(cfg["data_root"]) if args.machine == ["all"] else args.machine
+    dataset = get_dataset(cfg)
+    modalities = args.modality or [cfg.get("modality", "sound")]
+    for modality in modalities:
+        missing = set(modalities_of(modality)) - set(dataset.modalities)
+        if missing:
+            parser.error(f"dataset {cfg.get('dataset')!r} has no {sorted(missing)} data (has {dataset.modalities})")
+    machines = dataset.machines() if args.machine == ["all"] else args.machine
     if not machines:
         parser.error(f"no machine folders found under {cfg['data_root']}")
-    cache = FeatureCache(cfg["cache_dir"], cfg["features"])
 
     results = []
     for machine in machines:
-        for model_name in args.model:
-            r = run_one(machine, model_name, cfg, cache)
-            results.append(r)
-            metrics = "  ".join(f"{k}={r[k]:.3f}" for k in ("auc_source", "auc_target", "pauc", "hmean", "f1") if k in r)
-            print(f"[{machine:>9} | {model_name:>3}] {metrics}  ({r['fit_seconds']}s)")
+        for modality in modalities:
+            for model_name in args.model:
+                r = run_one(dataset, machine, model_name, modality, cfg)
+                results.append(r)
+                keys = ("auc_source", "auc_target", "auc_all", "pauc", "hmean", "f1")
+                metrics = "  ".join(f"{k}={r[k]:.3f}" for k in keys if k in r)
+                print(f"[{machine:>9} | {modality:>9} | {model_name:>3}] {metrics}  ({r['fit_seconds']}s)")
 
     summary = Path(cfg["output_dir"]) / "results.csv"
-    fields = ["machine", "model", "auc_source", "auc_target", "auc_all", "pauc", "hmean",
+    fields = ["dataset", "machine", "modality", "model", "auc_source", "auc_target", "auc_all", "pauc", "hmean",
               "precision", "recall", "f1", "n_train", "n_test", "fit_seconds"]
     new_file = not summary.exists()
     with open(summary, "a", newline="") as f:

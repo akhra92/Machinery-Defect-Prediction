@@ -1,10 +1,11 @@
 [project]
 name = "machine-sound-anomaly"
 version = "0.1.0"
-description = "Unsupervised anomalous sound detection for factory machinery (DCASE Task 2 style)"
+description = "Unsupervised machine fault detection from sound and vibration"
 requires-python = ">=3.10,<3.13"
 dependencies = [
     "numpy>=1.26",
+    "pandas>=2.2",
     "scipy>=1.11",
     "librosa>=0.10",
     "soundfile>=0.12",
